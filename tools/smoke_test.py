@@ -145,6 +145,10 @@ def _write_synthetic_bsergb(root, num_frames=6, height=64, width=96, events_per_
     scene = os.path.join(root, "scene_000")
     os.makedirs(os.path.join(scene, "images"))
     os.makedirs(os.path.join(scene, "events"))
+    # 生成与图像一一对应的真实时间戳
+    timestamps = np.arange(num_frames, dtype=np.float64)
+
+    np.savetxt(os.path.join(scene, "images", "timestamp.txt"), timestamps, fmt="%.6f")
     for i in range(num_frames):
         cv2.imwrite(os.path.join(scene, "images", f"{i:06d}.png"),
                     rng.integers(0, 255, (height, width, 3), dtype=np.uint8))
