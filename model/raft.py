@@ -87,7 +87,8 @@ class RAFT(nn.Module):
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
         return up_flow.reshape(N, 2, 8*H, 8*W)
 
-    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
+    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False,
+                *, return_quarter=False):
         """ Estimate optical flow between pair of frames """
 
         image1 = 2 * (image1 / self.input_scale) - 1.0
@@ -101,7 +102,10 @@ class RAFT(nn.Module):
 
         # run the feature network
         with autocast(enabled=self.args.mixed_precision):
-            fmap1, fmap2 = self.fnet([image1, image2])        
+            if return_quarter:
+                (fmap1, fmap2), quarter = self.fnet([image1, image2], return_quarter=True)
+            else:
+                fmap1, fmap2 = self.fnet([image1, image2])
         
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
@@ -176,5 +180,6 @@ class RAFT(nn.Module):
 
         if test_mode:
             return coords1 - coords0, flow_up
-            
+        if return_quarter:
+            return flow_predictions, coords1 - coords0, quarter
         return flow_predictions

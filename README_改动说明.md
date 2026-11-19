@@ -130,7 +130,7 @@ python train_bsergb.py --data-root ... --stage full --pretrained train/flow/last
     --raft-lr-mult 0.1 --rec-lr-mult 0.1 --epochs 40 --output-dir train/full
 ```
 
-- RAFT 权重使用官方的 `raft-things.pth`（princeton-vl/RAFT）。所有阶段的网络结构完全相同，因此可以用 `--pretrained` 严格加载上一阶段的权重。`--raft-ckpt` 在 `--pretrained` 之后加载，不会被阶段 1 中未训练的 RAFT 权重覆盖。
+- RAFT 权重使用官方的 `raft-things.pth`（princeton-vl/RAFT）。`--pretrained` 严格加载上一阶段的权重，可选局部匹配层的初始化方式见第 9 节。`--raft-ckpt` 在 `--pretrained` 之后加载，不会被阶段 1 中未训练的 RAFT 权重覆盖。
 - 用 DSER++ 的权重初始化 E2V：`--pretrained dser.pth --allow-partial-pretrained`。这只会加载 `event_rec.*`，其余键会被忽略。
 - `--resume` 时请保持冻结相关参数不变，因为参数分组需要一致。
 
@@ -207,3 +207,19 @@ conda activate evfi && python tools/check_env.py    # 之后随时可以重新�
   - NumPy 兼容性；
   - LPIPS 权重是否可用；
   - RAFT 权重能否严格加载进项目里的 RAFT。
+
+## 9. 粗光流引导的 1/4 尺度局部匹配
+
+P2 和 P3 可以复用 RAFT 的 `layer2` 特征，对两个目标到端点的方向分别做局部匹配。将最终的 1/8 粗光流上采样到 1/4 后，对于目标网格上的每个位置 `x`，以 `x + flow(x)` 为中心，从原始端点特征中采样候选。半径为 4 时，代价体每个位置有 81 个候选，越界候选会被屏蔽。局部匹配预测的残差上采样后加到 RAFT 已有的全分辨率光流，再送入原来的事件光流精修。残差头以零初始化，便于从旧权重开始训练。
+
+```bash
+# 使用已有彩色 P1，从 P2 开始，随后训练 P3
+BSERGB_ROOT=/path/to/BSERGB/3_TRAINING REC_RGB=1 FLOW_MATCH_RADIUS=4 bash train_model.sh flow
+
+# 使用同一个彩色 P1，训练半径为 0 的对照组
+BSERGB_ROOT=/path/to/BSERGB/3_TRAINING REC_RGB=1 FLOW_MATCH_RADIUS=0 bash train_model.sh flow
+```
+
+`train_model.sh` 默认使用半径 4，P2 和 P3 的输出目录分别为 `train/bsergb_flow_rgb_match_r4` 和 `train/bsergb_full_rgb_match_r4`。两个实验都读取 `train/bsergb_rec_rgb/last.pth`，也可通过 `REC_INIT` 指定已有的对应参考帧权重。省略 `flow` 时，脚本从 P1 开始。
+
+直接调用 `train_bsergb.py` 时用 `--flow-match-radius 4` 开启，省略该参数时使用基线结构。P3 和 `--resume` 需要沿用对应 checkpoint 的半径。`eval_bsergb.py` 从 checkpoint 自动恢复设置，旧 checkpoint 按半径 0 加载。

@@ -6,6 +6,7 @@
 #   bash train_model.sh flow       # 从 P2 开始（需要已有 P1 的 last.pth，或设置 REC_INIT）
 #   bash train_model.sh full       # 只跑 P3（需要已有 P2 的 last.pth）
 #   REC_RGB=1 bash train_model.sh  # 彩色参考帧实验，使用独立权重及日志目录
+#   REC_RGB=1 FLOW_MATCH_RADIUS=0 bash train_model.sh flow  # 跳过局部匹配的对照实验
 #   REC_INIT=/path/dser.pth bash train_model.sh flow   # 用 DSER++ 的 E2V 权重代替 P1
 #   EVAL_ROOT=/path/BSERGB/1_TEST bash train_model.sh  # P2、P3 结束后自动在测试集上评测 PSNR/SSIM
 #
@@ -35,6 +36,14 @@ if [[ "${REC_RGB:-0}" == "1" ]]; then
 fi
 
 REC_DIR="train/bsergb_rec${RUN_SUFFIX}"
+FLOW_MATCH_RADIUS="${FLOW_MATCH_RADIUS:-4}"
+if [[ ! "$FLOW_MATCH_RADIUS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "FLOW_MATCH_RADIUS 必须是非负整数" >&2
+  exit 1
+fi
+if [[ "$FLOW_MATCH_RADIUS" != "0" ]]; then
+  RUN_SUFFIX="${RUN_SUFFIX}_match_r${FLOW_MATCH_RADIUS}"
+fi
 FLOW_DIR="train/bsergb_flow${RUN_SUFFIX}"
 FULL_DIR="train/bsergb_full${RUN_SUFFIX}"
 LOG_DIR="train/logs${RUN_SUFFIX}"
@@ -101,6 +110,7 @@ if [[ "$START_STAGE" == "rec" || "$START_STAGE" == "flow" ]]; then
     --stage flow \
     "${FLOW_INIT[@]}" \
     --raft-ckpt "$RAFT_CKPT" --raft-iters 12 \
+    --flow-match-radius "$FLOW_MATCH_RADIUS" \
     --freeze-rec --raft-lr-mult 0.25 \
     --refine-iters 1 \
     --lambda-syn 1.0 --lambda-warp 0.5 \
@@ -116,6 +126,7 @@ run_logged "$LOG_DIR/p3_full.log" \
   --stage full \
   --pretrained "$FLOW_DIR/last.pth" \
   --raft-iters 12 --raft-lr-mult 0.1 --rec-lr-mult 0.1 \
+  --flow-match-radius "$FLOW_MATCH_RADIUS" \
   --refine-iters 1 --texture-window 3 \
   --lambda-rec 1.0 --lambda-syn 1.0 --lambda-warp 0.5 --lambda-ref 1.0 --lambda-ps 1.0 \
   --epochs 40 --lr 1e-4 --min-lr 1e-6 \

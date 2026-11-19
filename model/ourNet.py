@@ -2,7 +2,7 @@
 
 Pipeline (one target time t per forward pass):
   1. E2V      : EventRecNet reconstructs gray or color at t from events and optional key frames
-  2. coarse   : RAFT matches the reference at t against the two key frames -> F_{t->0}, F_{t->1}
+  2. coarse   : RAFT matches the reference against both key frames, optionally adding 1/4-scale local matching
   3. refine   : events E_{t->k} + coarse flow -> refined flow + occlusion
   4. fuse     : backward-warp I_0, I_1 -> W_0, W_1 -> selective fusion -> coarse frame
   5. HCS      : event-defined motion patches (DSER++)
@@ -19,9 +19,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from model.blocks import EventRecNet
-from model.flow_modules import CoarseFlowEstimator, EventFlowRefiner, SelectiveFusion
+from model.flow_modules import CoarseFlowEstimator, EventFlowRefiner, QuarterFlowMatcher, SelectiveFusion
 from model.texture import FlowGuidedTextureMapper, TextureRefineDecoder, hcs_patch_masks
-from model.warp import backwarp, bgr_to_gray, reverse_voxel
+from model.warp import backwarp, bgr_to_gray, resize_flow, reverse_voxel
 
 STAGES = ("rec", "flow", "full")
 
@@ -50,6 +50,10 @@ class MyNet(nn.Module):
         # 2. coarse flow from the cost volume
         self.coarse_flow = CoarseFlowEstimator(iters=int(getattr(args, "raft_iters", 12)),
                                                freeze_bn=not getattr(args, "no_freeze_raft_bn", False))
+        self.flow_match_radius = int(getattr(args, "flow_match_radius", 0))
+        if self.flow_match_radius < 0:
+            raise ValueError("flow_match_radius must be nonnegative")
+        self.quarter_matcher = QuarterFlowMatcher(self.flow_match_radius) if self.flow_match_radius else None
         # 3. event-guided refinement (shared by both directions)
         self.refiner = EventFlowRefiner(self.bins, flow_norm=flow_norm,
                                         iters=int(getattr(args, "refine_iters", 1)))
@@ -109,13 +113,22 @@ class MyNet(nn.Module):
         # ---- 2. coarse flow from the cost volume ------------------------------
         rec_for_flow = pure_rec.detach() if self.detach_rec_for_flow else pure_rec
         if self.rec_rgb:
-            ref_color = self.build_reference(rec_for_flow, img0, img1, mask)
-            flows_t0, flows_t1 = self.coarse_flow(ref_color, img0, img1)
-            ref_t = bgr_to_gray(ref_color)  # downstream modules expect a one-channel reference
+            ref_match = self.build_reference(rec_for_flow, img0, img1, mask)
+            match0, match1 = img0, img1
+            ref_t = bgr_to_gray(ref_match)  # downstream modules expect a one-channel reference
         else:
             ref_t = self.build_reference(rec_for_flow, gray0, gray1, mask)
-            flows_t0, flows_t1 = self.coarse_flow(ref_t, gray0, gray1)
+            ref_match, match0, match1 = ref_t, gray0, gray1
+        coarse_outputs = self.coarse_flow(ref_match, match0, match1,
+                                          return_quarter=self.quarter_matcher is not None)
+        flows_t0, flows_t1 = coarse_outputs[:2]
         coarse_t0, coarse_t1 = flows_t0[-1], flows_t1[-1]
+        if self.quarter_matcher is not None:
+            residual = self.quarter_matcher(*coarse_outputs[2])
+            residual0, residual1 = resize_flow(residual, size=img0.shape[-2:]).chunk(2, dim=0)
+            # Add the correction to RAFT's learned full-resolution upsampling.
+            coarse_t0 = coarse_t0 + residual0
+            coarse_t1 = coarse_t1 + residual1
 
         # ---- 3. event-guided refinement (events always in the t -> k direction) -
         events_t0 = reverse_voxel(v0t)           # E_{t->0}
@@ -143,6 +156,9 @@ class MyNet(nn.Module):
             "fusion_mask": fusion_mask,
             "hcs0": hcs0, "hcs1": hcs1, "hcs_list": hcs_union,
         }
+        if self.quarter_matcher is not None:
+            aux["matched_flow_t0"] = coarse_t0
+            aux["matched_flow_t1"] = coarse_t1
 
         if self.stage == "flow":
             # Flow stage: texture/decoder are not trained; return the coarse frame pyramid.

@@ -113,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raft-ckpt", default=None,
                         help="Official RAFT weights (e.g. raft-things.pth) loaded into the coarse flow net")
     parser.add_argument("--raft-iters", default=12, type=int)
+    parser.add_argument("--flow-match-radius", default=0, type=int,
+                        help="Local search radius in quarter-resolution pixels (0 disables)")
     parser.add_argument("--refine-iters", default=1, type=int)
     parser.add_argument("--texture-window", default=3, type=int)
     parser.add_argument("--ref-mode", default="composite", choices=("composite", "rec"),
@@ -194,6 +196,13 @@ def _torch_load(path: str) -> object:
 def load_network_weights(model: torch.nn.Module, path: str, strict: bool,) -> None:
     checkpoint = _torch_load(path)
     state_dict = _extract_state_dict(checkpoint)
+    matcher = getattr(model, "quarter_matcher", None)
+    prefix = "quarter_matcher."
+    if strict and matcher is not None and not any(key.startswith(prefix) for key in state_dict):
+        # Stage-1 and baseline checkpoints predate the optional matcher. Keep its
+        # zero-residual initialization and still require every other weight.
+        state_dict.update({prefix + key: value for key, value in matcher.state_dict().items()})
+        print("Initialized the quarter-resolution matcher for this pretrained checkpoint")
     incompatible = model.load_state_dict(state_dict, strict=strict)
     if not strict:
         print(f"Missing keys: {list(incompatible.missing_keys)}")
@@ -349,6 +358,8 @@ def configure_trainable(model: MyNet, args: argparse.Namespace) -> None:
     frozen = []
     if args.stage == "rec":
         frozen += ["coarse_flow", "refiner", "fusion", "texture", "decoder"]
+        if model.quarter_matcher is not None:
+            frozen.append("quarter_matcher")
     elif args.stage == "flow":
         frozen += ["texture", "decoder"]
     if args.freeze_rec:
@@ -458,6 +469,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("max-steps-per-epoch must be positive")
     if args.crop_size <= 0 or args.mask_patch_size <= 0:
         raise ValueError("crop-size and mask-patch-size must be positive")
+    if args.flow_match_radius < 0:
+        raise ValueError("flow-match-radius must be nonnegative")
     if args.crop_size % 32 != 0:
         raise ValueError("crop-size must be divisible by 32")
     if args.crop_size % args.mask_patch_size != 0:

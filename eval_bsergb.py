@@ -55,7 +55,7 @@ PROTOCOLS = ("ofaf", "nonoverlap", "all")
 MODEL_DEFAULTS = dict(
     bins=8, stage="full", beta=0.1, mask_patch_size=32, hcs_beta_mode="sum",
     ref_mode="composite", rec_use_frames=False, rec_rgb=False,
-    detach_rec_for_flow=False, raft_iters=12, refine_iters=1,
+    detach_rec_for_flow=False, raft_iters=12, flow_match_radius=0, refine_iters=1,
     texture_window=3, no_freeze_raft_bn=False,
 )
 
@@ -386,6 +386,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
     summary.update({
         "checkpoint": str(args.checkpoint), "stage": model_args.stage,
         "epoch": epoch, "protocol": args.protocol,
+        "flow_match_radius": model_args.flow_match_radius,
         "quantized": not args.no_quantize,
         "seconds_per_frame_model": gpu_time / max(1, len(rows)),
         "seconds_total": time.time() - start_time,

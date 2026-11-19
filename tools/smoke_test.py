@@ -15,10 +15,12 @@ import torch.nn as nn
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from model.flow_modules import QuarterFlowMatcher  # noqa: E402
 from model.loss import MaskedSSIMLoss  # noqa: E402
 from model.ourNet import MyNet  # noqa: E402
 from model.texture import hcs_patch_masks  # noqa: E402
-from model.warp import backwarp, reverse_voxel  # noqa: E402
+from model.utils.utils import coords_grid  # noqa: E402
+from model.warp import backwarp, resize_flow, reverse_voxel  # noqa: E402
 from util.event import EventSequence  # noqa: E402
 from util.utils_func import mask_reverse, pyramid_patch_mask  # noqa: E402
 from util.voxelization import to_voxel_grid  # noqa: E402
@@ -53,6 +55,24 @@ def test_backwarp_direction(device):
     err = (warped - gt)[..., shift:].abs().max().item()
     assert err < 1e-5, f"backwarp convention broken (err={err})"
     print("[ok] backwarp: backwarp(I0, F_t->0) reproduces I_t")
+
+
+def test_quarter_matching(device):
+    height, width = 6, 8
+    source = torch.eye(height * width, device=device).reshape(1, -1, height, width)
+    # The query at (x, y) matches the source at (x + 3, y - 1).
+    query = torch.roll(source, shifts=(1, -3), dims=(-2, -1))
+    coarse = torch.zeros(1, 2, height // 2, width // 2, device=device)
+    coarse[:, 0] = 1  # becomes +2 on the quarter-resolution grid
+    centers = (coords_grid(1, height, width, device) + resize_flow(coarse, size=(height, width)))
+    centers = centers.permute(0, 2, 3, 1)
+    matcher = QuarterFlowMatcher(radius=4).to(device)
+    scores = matcher._correlation_chunk(query, source, centers, matcher.offsets)
+    best_offset = matcher.offsets[scores[0, :, 3, 3].argmax()]
+    assert best_offset.tolist() == [1, -1]
+    invalid = (matcher.offsets == matcher.offsets.new_tensor([-4, -4])).all(dim=1)
+    assert scores[0, invalid, 0, 0].item() == -2
+    print("[ok] quarter matching: search center, flow units, and out-of-frame candidates")
 
 
 def test_reverse_voxel(bins=8):
@@ -103,9 +123,11 @@ def random_window_batch(batch, num_targets, bins, height, width, device):
     }
 
 
-def test_stage(stage, device, num_targets=3, size=128):
+def test_stage(stage, device, num_targets=3, size=128, *, flow_match_radius=0, rec_rgb=False):
     torch.manual_seed(0)
     args = make_args(stage)
+    args.flow_match_radius = flow_match_radius
+    args.rec_rgb = rec_rgb
     model = MyNet(args).to(device)
     tb.configure_trainable(model, args)
     groups = tb.build_param_groups(model, args)
@@ -134,6 +156,11 @@ def test_stage(stage, device, num_targets=3, size=128):
         assert [p.shape[-1] for p in preds] == [size, size // 2, size // 4]
         assert sel.shape == (n, 1, size, size)
         assert aux["flow_t0"].shape == (n, 2, size, size)
+        assert torch.isfinite(preds[0]).all()
+        if flow_match_radius:
+            torch.testing.assert_close(aux["matched_flow_t0"], aux["flows_t0"][-1], rtol=0, atol=0)
+            torch.testing.assert_close(aux["matched_flow_t1"], aux["flows_t1"][-1], rtol=0, atol=0)
+            assert torch.count_nonzero(model.quarter_matcher.update[-1].weight.grad) > 0
     msg = ", ".join(f"{name}={float(value):.4f}" for name, value in losses.items())
     print(f"[ok] stage={stage}, K={n}: outputs for {n} targets, params with grad {with_grad}/{len(trainable)} | {msg}")
 
@@ -264,8 +291,12 @@ def test_eval_metrics_and_script():
     with tempfile.TemporaryDirectory() as root:
         data_root = os.path.join(root, "test")
         _write_synthetic_bsergb(data_root)                         # 6 frames of 64x96
+        pretrained = os.path.join(root, "p1.pth")
+        torch.save({"net": MyNet(make_args("rec")).state_dict()}, pretrained)
         args = make_args("full")
+        args.flow_match_radius = 4
         model = MyNet(args)
+        tb.load_network_weights(model, pretrained, strict=True)
         ckpt = os.path.join(root, "last.pth")
         torch.save({"net": model.state_dict(), "args": vars(args), "epoch": 0}, ckpt)
         out_dir = os.path.join(root, "eval")
@@ -275,7 +306,10 @@ def test_eval_metrics_and_script():
         # OF-AF protocol (default), 6 frames: skip=1 -> starts 0,1,2,3 -> frames 1..4 (4 frames);
         # skip=3 -> start 0 -> frames 1..3 (3 frames)
         assert summary["protocol"] == "ofaf"
+        assert summary["flow_match_radius"] == 4
         assert summary["skips"]["1"]["frames"] == 4 and summary["skips"]["3"]["frames"] == 3, summary["skips"]
+        for skip in ("1", "3"):
+            assert np.isfinite(list(summary["skips"][skip]["frame_mean"].values())).all()
         assert set(summary["skips"]["3"]["by_t"]) == {"0.25", "0.5", "0.75"}
         assert os.path.isfile(os.path.join(out_dir, "per_frame.csv"))
         assert os.path.isfile(os.path.join(out_dir, "images", "skip3", "scene_000", "000002.png"))
@@ -284,6 +318,7 @@ def test_eval_metrics_and_script():
             "--skips", "1", "--stage", "flow", "--protocol", "nonoverlap", "--output-dir", out_dir + "_flow"]))
         # non-overlapping windows: skip=1 -> (0,2),(2,4) = 2 frames
         assert flow_summary["stage"] == "flow" and flow_summary["skips"]["1"]["frames"] == 2
+        assert np.isfinite(list(flow_summary["skips"]["1"]["frame_mean"].values())).all()
     print("[ok] eval_bsergb: metrics, OF-AF / non-overlap window protocols, CSV/PNG outputs, flow-stage scoring")
 
 
@@ -292,13 +327,15 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     device = torch.device(parser.parse_args().device)
     test_backwarp_direction(device)
+    test_quarter_matching(device)
     test_reverse_voxel()
     test_hcs_equivalence(device)
     test_dataset_multi_target()
     test_dataset_cropped_event_timestamps()
-    for stage_name in ("rec", "flow", "full"):
-        test_stage(stage_name, device, num_targets=3)   # skip=3 window
-    test_stage("full", device, num_targets=1)           # skip=1 window
+    test_stage("rec", device, num_targets=3)
+    test_stage("flow", device, num_targets=3, flow_match_radius=4, rec_rgb=True)
+    test_stage("full", device, num_targets=3)
+    test_stage("full", device, num_targets=1, flow_match_radius=4)
     test_inference_padding()
     test_eval_metrics_and_script()
     print("All smoke tests passed.")

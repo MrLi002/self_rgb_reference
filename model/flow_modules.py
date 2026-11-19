@@ -1,14 +1,16 @@
-"""Stage 2-4 modules: coarse flow (cost volume), event-guided refinement, selective fusion."""
-from typing import List, Optional, Tuple
+"""Stage 2-4 modules: coarse flow, local matching, event refinement, and fusion."""
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from model.blocks import DenseBlock, up
 from model.raft import RAFT, default_raft_args
 from model.submodules import conv_resblock_one
-from model.warp import backwarp, bgr_to_gray
+from model.utils.utils import coords_grid
+from model.warp import backwarp, bgr_to_gray, resize_flow
 
 
 def _strip_prefix(state_dict, prefix="module."):
@@ -48,7 +50,7 @@ class CoarseFlowEstimator(nn.Module):
         return self
 
     def forward(self, ref_t: torch.Tensor, frame0: torch.Tensor, frame1: torch.Tensor,
-                iters: Optional[int] = None) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+                iters: Optional[int] = None, *, return_quarter: bool = False):
         batch = ref_t.shape[0]
         channels = ref_t.shape[1]
         if channels not in (1, 3) or frame0.shape[1] != channels or frame1.shape[1] != channels:
@@ -62,10 +64,71 @@ class CoarseFlowEstimator(nn.Module):
             image1 = image1[:, [2, 1, 0]]
             image2 = image2[:, [2, 1, 0]]
         # RAFT runs its encoders with autocast disabled, so feed fp32 even under --amp.
-        predictions = self.raft(image1.float(), image2.float(), iters=iters or self.iters)
+        result = self.raft(image1.float(), image2.float(), iters=iters or self.iters,
+                           return_quarter=return_quarter)
+        if return_quarter:
+            predictions, flow_eighth, quarter_features = result
+        else:
+            predictions = result
         flows_t0 = [flow[:batch] for flow in predictions]
         flows_t1 = [flow[batch:] for flow in predictions]
+        if return_quarter:
+            return flows_t0, flows_t1, (flow_eighth, *quarter_features)
         return flows_t0, flows_t1
+
+
+class QuarterFlowMatcher(nn.Module):
+    """Search the original key-frame features around x + upsampled RAFT flow(x)."""
+
+    def __init__(self, radius: int):
+        super().__init__()
+        self.radius = radius
+        axis = torch.arange(-radius, radius + 1)
+        y, x = torch.meshgrid(axis, axis, indexing="ij")
+        offsets = torch.stack((x, y), dim=-1).reshape(-1, 2)
+        self.register_buffer("offsets", offsets, persistent=False)
+        # RAFT BasicEncoder.layer2 provides 96 channels at quarter resolution.
+        self.project = nn.Conv2d(96, 32, 1)
+        self.update = nn.Sequential(
+            conv_resblock_one(len(offsets) + 32 + 2, 64),
+            nn.Conv2d(64, 2, 3, padding=1),
+        )
+        nn.init.zeros_(self.update[-1].weight)
+        nn.init.zeros_(self.update[-1].bias)
+
+    @staticmethod
+    def _correlation_chunk(query, source, centers, offsets):
+        batch, channels, height, width = query.shape
+        points = centers[:, None] + offsets[None, :, None, None]
+        x, y = points.unbind(dim=-1)
+        valid = (x >= 0) & (x <= width - 1) & (y >= 0) & (y <= height - 1)
+        grid = torch.stack((2 * x / max(width - 1, 1) - 1,
+                            2 * y / max(height - 1, 1) - 1), dim=-1)
+        candidates = F.grid_sample(source, grid.reshape(batch, -1, width, 2),
+                                   mode="bilinear", padding_mode="zeros", align_corners=True)
+        candidates = candidates.reshape(batch, channels, len(offsets), height, width)
+        similarity = (query.unsqueeze(2) * candidates).sum(dim=1)
+        # Valid cosine scores lie between -1 and 1.
+        return similarity.masked_fill(~valid, -2.0)
+
+    def forward(self, flow_eighth, ref_features, key_features):
+        batch, _, height, width = ref_features.shape
+        flow = resize_flow(flow_eighth.float(), size=(height, width))
+        centers = (coords_grid(batch, height, width, device=flow.device) + flow).permute(0, 2, 3, 1)
+        query = F.normalize(self.project(ref_features).float(), dim=1, eps=1e-6)
+        source = F.normalize(self.project(key_features).float(), dim=1, eps=1e-6)
+        correlation = []
+        for offsets in self.offsets.split(9):
+            if self.training and torch.is_grad_enabled():
+                # Save scores and recompute sampled features during backward.
+                scores = checkpoint(self._correlation_chunk, query, source, centers, offsets,
+                                    use_reentrant=False, preserve_rng_state=False)
+            else:
+                scores = self._correlation_chunk(query, source, centers, offsets)
+            correlation.append(scores)
+        correlation = torch.cat(correlation, dim=1)
+        residual = self.radius * torch.tanh(self.update(torch.cat((query, correlation, flow / 5.0), dim=1)))
+        return residual * (correlation.amax(dim=1, keepdim=True) > -2.0)
 
 
 class EventFlowRefiner(nn.Module):
