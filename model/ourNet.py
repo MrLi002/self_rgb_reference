@@ -132,8 +132,7 @@ class MyNet(nn.Module):
         coarse, fusion_mask = self.fusion(warp0, warp1, ref_t, vis0, vis1, flow_t0, flow_t1, mask, t_map)
 
         # ---- 5. event-defined motion regions (DSER++ HCS) ----------------------
-        hcs0, hcs1, hcs_union = hcs_patch_masks(img0, img1, coarse, mask, self.mask_patch_size,
-                                                self.beta, self.hcs_mode)
+        hcs0, hcs1, hcs_union = hcs_patch_masks(img0, img1, coarse, mask, self.mask_patch_size, self.beta, self.hcs_mode)
 
         aux: Dict[str, object] = {
             "ref": ref_t,
@@ -147,15 +146,11 @@ class MyNet(nn.Module):
 
         if self.stage == "flow":
             # Flow stage: texture/decoder are not trained; return the coarse frame pyramid.
-            predictions = [coarse,
-                           F.interpolate(coarse, scale_factor=0.5, mode="bilinear", align_corners=False),
-                           F.interpolate(coarse, scale_factor=0.25, mode="bilinear", align_corners=False)]
+            predictions = [coarse, F.interpolate(coarse, scale_factor=0.5, mode="bilinear", align_corners=False), F.interpolate(coarse, scale_factor=0.25, mode="bilinear", align_corners=False)]
         else:
             # ---- 6. flow-guided texture mapping + refinement ------------------
-            texture, tex_conf, frame0_share = self.texture(img0, img1, coarse, ref_t, flow_t0, flow_t1,
-                                                           vis0, vis1)
-            predictions = self.decoder(coarse, warp0, warp1, ref_t, fusion_mask, mask, vis0, vis1,
-                                       v01, texture, hcs_union[1], tex_conf, frame0_share)
+            texture, tex_conf, frame0_share = self.texture(img0, img1, coarse, ref_t, flow_t0, flow_t1, vis0, vis1)
+            predictions = self.decoder(coarse, warp0, warp1, ref_t, fusion_mask, mask, vis0, vis1, v01, texture, hcs_union[1], tex_conf, frame0_share)
             aux["tex_conf"] = tex_conf
             aux["tex_frame0_share"] = frame0_share
 

@@ -1,7 +1,7 @@
 """BS-ERGB training data loader.
 
-The BS-ERGB release stores one RGB image per timestamp and one event file for
-each adjacent image interval. Every skip-N window (endpoints ``start`` and
+The BS-ERGB release stores one RGB image per timestamp in
+``images/timestamp.txt`` and one event file per adjacent image interval. Every skip-N window (endpoints ``start`` and
 ``end = start + N + 1``) is one training sample.
 
 ``target_mode="all"`` (default): a window returns **all N intermediate frames**
@@ -19,7 +19,7 @@ Every sample is a dict with K = number of targets::
     gts       : (K, 3, H, W)       ground-truth intermediate frames (ascending time)
     voxels    : (K, 3*bins, H, W)  per target [E_0->t, E_t->1, E_1->t]
     masks     : (K, 1, H, W)       per target event mask
-    t         : (K,)               normalised target times (target-start)/(end-start)
+    t         : (K,)               actual timestamp ratio (T_target-T_start)/(T_end-T_start)
 
 Windows with different K cannot be stacked into one batch; use
 ``SkipGroupedBatchSampler`` when batch_size > 1.
@@ -75,25 +75,108 @@ def _list_files(folder: Path, suffixes: Iterable[str]) -> List[Path]:
     )
 
 
-def _load_event_chunks(paths: Sequence[Path], crop_box: CropBox) -> List[np.ndarray]:
-    """Load and crop each interval file once (one array per adjacent-frame interval)."""
-    return [load_events(str(path), bsergb=True, size=crop_box) for path in paths]
+def _read_frame_timestamps(path: Path, expected_images: int) -> np.ndarray:
+    """Read one absolute frame timestamp per image (same units/clock as .npz events)."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing BS-ERGB frame timestamp file: {path}")
+    timestamps = np.asarray(np.loadtxt(path, dtype=np.float64), dtype=np.float64).reshape(-1)
+    if len(timestamps) != expected_images:
+        raise ValueError(
+            f"{path}: expected {expected_images} frame timestamps, found {len(timestamps)}"
+        )
+    if not np.all(np.isfinite(timestamps)):
+        raise ValueError(f"{path}: timestamps must be finite numbers")
+    if not np.all(np.diff(timestamps) > 0):
+        raise ValueError(f"{path}: frame timestamps must be strictly increasing")
+    return timestamps
 
 
-def _sequence_from_chunks(chunks: Sequence[np.ndarray], height: int, width: int) -> Optional[EventSequence]:
-    """Concatenate interval chunks into one time-sorted EventSequence (None if empty)."""
+def _timestamp_tolerance(start: float, end: float) -> float:
+    """Allow only tiny rounding error from util.event.load_events' float32 timestamps."""
+    fp32_res = max(
+        float(abs(np.spacing(np.float32(start)))),
+        float(abs(np.spacing(np.float32(end)))),
+    )
+    return max(1e-6 * (end - start), 2.0 * fp32_res)
+
+
+def _load_event_chunks(
+    paths: Sequence[Path],
+    crop_box: CropBox,
+    frame_timestamps: Optional[Sequence[float]] = None,
+    start_interval: int = 0,
+) -> List[np.ndarray]:
+    """Load and crop event files, optionally verifying their true time boundaries.
+
+    ``paths[j]`` covers [T[start_interval+j], T[start_interval+j+1]].
+    ``frame_timestamps=None`` preserves compatibility with older callers; new
+    training code always passes timestamps. For correct evaluation, eval_bsergb.py
+    must pass timestamps as well.
+    """
+    if frame_timestamps is not None and start_interval + len(paths) >= len(frame_timestamps):
+        raise IndexError("Event interval indexes exceed frame timestamp array")
+    chunks = []
+    for offset, path in enumerate(paths):
+        chunk = load_events(str(path), bsergb=True, size=crop_box)
+        if frame_timestamps is not None and chunk.size:
+            t0 = float(frame_timestamps[start_interval + offset])
+            t1 = float(frame_timestamps[start_interval + offset + 1])
+            tolerance = _timestamp_tolerance(t0, t1)
+            event_times = chunk[:, 2]
+            low, high = float(event_times.min()), float(event_times.max())
+            if low < t0 - tolerance or high > t1 + tolerance:
+                raise ValueError(
+                    f"Event timestamps in {path} [{low}, {high}] do not fit "
+                    f"frame interval [{t0}, {t1}]. Check time units, clock "
+                    "origin, filename ordering, and timestamp.txt alignment."
+                )
+            # Roundoff in the .npz float32 timestamps can place a boundary event
+            # a fraction of a unit outside the float64 frame interval.
+            # Snap just those boundary events back inside the true interval.
+            chunk[:, 2] = np.clip(event_times, t0, t1)
+        chunks.append(chunk)
+    return chunks
+
+
+def _sequence_from_chunks(
+    chunks: Sequence[np.ndarray],
+    height: int,
+    width: int,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+) -> Optional[EventSequence]:
+    """Build an event sequence with fixed frame-time bounds, never crop min/max.
+
+    Empty spatial crops return None; the caller converts them to zero voxels.
+    Optional bounds are retained only for compatibility with older test callers.
+    """
+    if (start_time is None) != (end_time is None):
+        raise ValueError("start_time and end_time must be specified together")
+    if start_time is not None and not end_time > start_time:
+        raise ValueError(f"Invalid event time range: [{start_time}, {end_time}]")
     non_empty = [chunk for chunk in chunks if chunk.size]
     if not non_empty:
         return None
-    features = np.concatenate(non_empty, axis=0)  # always a fresh copy
+    features = np.concatenate(non_empty, axis=0)
     if features.shape[0] > 1 and np.any(np.diff(features[:, 2]) < 0):
         features = features[np.argsort(features[:, 2], kind="stable")]
-    return EventSequence(features, height, width)
+    if start_time is None:
+        return EventSequence(features, height, width)
+    return EventSequence(
+        features, height, width,
+        start_time=float(start_time), end_time=float(end_time),
+    )
 
 
-def _load_sequence(paths: Sequence[Path], height: int, width: int, crop_box: CropBox) -> Optional[EventSequence]:
-    """Load, crop, and concatenate an interval of BS-ERGB event files."""
-    return _sequence_from_chunks(_load_event_chunks(paths, crop_box), height, width)
+def _load_sequence(
+    paths: Sequence[Path], height: int, width: int, crop_box: CropBox,
+    start_time: Optional[float] = None, end_time: Optional[float] = None,
+) -> Optional[EventSequence]:
+    """Compatibility helper; pass frame-time bounds for accurate voxelization."""
+    return _sequence_from_chunks(
+        _load_event_chunks(paths, crop_box), height, width,
+        start_time=start_time, end_time=end_time,
+    )
 
 
 def _voxel_or_zeros(sequence: Optional[EventSequence], bins: int, height: int, width: int) -> torch.Tensor:
@@ -116,6 +199,7 @@ class BSERGBTrainDataset(Dataset):
         data_root/
           scene_name/
             images/*.png
+            images/timestamp.txt
             events/*.npz
 
     Images remain in OpenCV BGR channel order to match the existing DSER++
@@ -194,11 +278,14 @@ class BSERGBTrainDataset(Dataset):
         event_paths = _list_files(event_folder, (".npz",))
         if len(image_paths) < 3:
             raise RuntimeError(f"Scene {scene_name!r} contains fewer than three images")
-        if len(event_paths) < len(image_paths) - 1:
+        if len(event_paths) != len(image_paths) - 1:
             raise RuntimeError(
-                f"Scene {scene_name!r} has {len(image_paths)} images but only "
-                f"{len(event_paths)} event intervals"
+                f"Scene {scene_name!r} must have images-1 event files: "
+                f"images={len(image_paths)}, events={len(event_paths)}"
             )
+        timestamps = _read_frame_timestamps(
+            image_folder / "timestamp.txt", expected_images=len(image_paths)
+        )
 
         first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
         if first is None:
@@ -213,7 +300,7 @@ class BSERGBTrainDataset(Dataset):
         scene_index = len(self.scene_metadata)
         self.scene_metadata.append(
             {"name": scene_name, "images": image_paths, "events": event_paths,
-             "height": height, "width": width}
+             "timestamps": timestamps, "height": height, "width": width}
         )
 
         excluded = self.excluded_frame_indices.get(scene_name, set())
@@ -277,6 +364,7 @@ class BSERGBTrainDataset(Dataset):
         metadata = self.scene_metadata[scene_index]
         image_paths = metadata["images"]
         event_paths = metadata["events"]
+        timestamps = metadata["timestamps"]
         height, width = int(metadata["height"]), int(metadata["width"])
         h, w = self.crop_height, self.crop_width
 
@@ -290,12 +378,21 @@ class BSERGBTrainDataset(Dataset):
         gts = torch.stack([read(target) for target in targets], dim=0)        # (K, 3, h, w)
 
         # every interval file of the window is read once and shared by all targets
-        chunks = _load_event_chunks(event_paths[start:end], crop_box)
+        chunks = _load_event_chunks(
+            event_paths[start:end], crop_box,
+            frame_timestamps=timestamps, start_interval=start,
+        )
         voxel_list, mask_list = [], []
         for target in targets:
             split = target - start                       # number of intervals in [start, target]
-            events_0t = _sequence_from_chunks(chunks[:split], h, w)
-            events_t1 = _sequence_from_chunks(chunks[split:], h, w)
+            events_0t = _sequence_from_chunks(
+                chunks[:split], h, w,
+                start_time=timestamps[start], end_time=timestamps[target],
+            )
+            events_t1 = _sequence_from_chunks(
+                chunks[split:], h, w,
+                start_time=timestamps[target], end_time=timestamps[end],
+            )
             event_counts = torch.cat(
                 (_event_channels_or_zeros(events_0t, h, w), _event_channels_or_zeros(events_t1, h, w)), dim=0)
             mask_list.append(process_mask(event_counts).float())
@@ -307,8 +404,11 @@ class BSERGBTrainDataset(Dataset):
             ), dim=0).float())
         voxels = torch.stack(voxel_list, dim=0)                               # (K, 3*bins, h, w)
         masks = torch.stack(mask_list, dim=0)                                 # (K, 1, h, w)
-        times = torch.tensor([(target - start) / float(end - start) for target in targets],
-                             dtype=torch.float32)                             # (K,)
+        times = torch.tensor(
+            [(timestamps[target] - timestamps[start]) / (timestamps[end] - timestamps[start])
+             for target in targets],
+            dtype=torch.float32,
+        )                                                                    # (K,)
 
         if self.augment:
             vertical_flip = random.random() < 0.5
@@ -388,3 +488,4 @@ def build_bsergb_train_dataset(data_root: str | os.PathLike[str], bins: int = 8,
         augment=augment,
         target_mode=target_mode,
     )
+
