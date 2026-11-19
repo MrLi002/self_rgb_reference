@@ -336,7 +336,7 @@ def events_to_channels(event: EventSequence):
     """
     xs = event._features_torch[:, 0]
     ys = event._features_torch[:, 1]
-    ps = event._features_torch[:, 3]
+    ps = event._features_torch[:, 3].to(dtype=torch.get_default_dtype())
     sensor_size = [event._image_height, event._image_width]
     assert len(xs) == len(ys) and len(ys) == len(ps)
 

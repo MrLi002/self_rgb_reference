@@ -41,9 +41,31 @@ def save_events(events, file):
     )
 
 
-def load_events(file, hsergb=False, bsergb=False, hqf=False, size=None):
+def _bsergb_timestamps(raw_timestamps, file, bounds):
+    timestamps = raw_timestamps.reshape(-1).astype(np.float64)
+    if bounds is None or not timestamps.size:
+        return timestamps
+
+    start, end = map(float, bounds)
+    source_type = raw_timestamps.dtype.type
+    if not np.issubdtype(source_type, np.floating):
+        source_type = np.float64
+    rounding = max(abs(np.spacing(source_type(start))), abs(np.spacing(source_type(end))))
+    tolerance = max(1e-6 * (end - start), 2.0 * rounding)
+    low, high = timestamps.min(), timestamps.max()
+    if not np.isfinite([low, high]).all() or low < start - tolerance or high > end + tolerance:
+        raise ValueError(
+            f"Event timestamps in {file} [{low}, {high}] do not fit frame interval "
+            f"[{start}, {end}]. Check time units, clock origin, filename ordering, "
+            "and timestamp.txt alignment."
+        )
+    return np.clip(timestamps, start, end, out=timestamps)
+
+
+def load_events(file, hsergb=False, bsergb=False, hqf=False, size=None, *, timestamp_bounds=None):
     """
-        Load event data and return a numpy array
+        Load event data and return a numpy array. For BS-ERGB, validate optional
+        frame timestamp bounds before cropping and retain float64 timestamps.
     """
     if file.lower().endswith('.txt'):
         data = np.loadtxt(file, dtype=np.float32)
@@ -62,7 +84,7 @@ def load_events(file, hsergb=False, bsergb=False, hqf=False, size=None):
             (x, y, timestamp, polarity) = (
                 tmp["x"].astype(np.float32).reshape((-1,)),
                 tmp["y"].astype(np.float32).reshape((-1,)),
-                tmp["timestamp"].astype(np.float32).reshape((-1,)),
+                _bsergb_timestamps(tmp["timestamp"], file, timestamp_bounds),
                 tmp["polarity"].astype(np.float32).reshape((-1,)) * 2 - 1,  # to convert from 0,1 to 1,-1 polarity
             )
             x = (

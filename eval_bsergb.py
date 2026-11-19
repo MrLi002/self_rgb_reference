@@ -36,15 +36,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from common.size_adapter import ImgAndEventSizeAdapter
 from datasets.bsergb import (
-    _event_channels_or_zeros,
     _list_files,
-    _load_event_chunks,
     _read_frame_timestamps,
-    _sequence_from_chunks,
-    _voxel_or_zeros,
+    _window_event_inputs,
 )
 from model.ourNet import MyNet
-from util.utils_func import process_mask
 
 # OF-AF BSERGB_Test.skip_inds (0-based image indexes).
 OFAF_SKIP_INDS = {
@@ -257,43 +253,12 @@ class BSERGBEvalWindows(Dataset):
         height, width = img0.shape[-2:]
         targets = list(range(start + 1, end))
         gts = torch.stack([self._read(scene["images"][k]) for k in targets])
-        chunks = _load_event_chunks(
-            scene["events"][start:end],
-            (0, 0, height, width),
-            frame_timestamps=timestamps,
-            start_interval=start,
+        voxels, masks, times = _window_event_inputs(
+            scene["events"], (0, 0, height, width), timestamps, start, end, targets, self.bins,
         )
-        voxels, masks = [], []
-        for target in targets:
-            split = target - start
-            # Explicit frame-time boundaries, identical to datasets/bsergb.py train loader.
-            ev_0t = _sequence_from_chunks(
-                chunks[:split], height, width,
-                start_time=timestamps[start], end_time=timestamps[target],
-            )
-            ev_t1 = _sequence_from_chunks(
-                chunks[split:], height, width,
-                start_time=timestamps[target], end_time=timestamps[end],
-            )
-            counts = torch.cat((
-                _event_channels_or_zeros(ev_0t, height, width),
-                _event_channels_or_zeros(ev_t1, height, width)
-            ), dim=0)
-            masks.append(process_mask(counts).float())
-            ev_1t = None if ev_t1 is None else ev_t1.copy().reverse()
-            voxels.append(torch.cat((
-                _voxel_or_zeros(ev_0t, self.bins, height, width),
-                _voxel_or_zeros(ev_t1, self.bins, height, width),
-                _voxel_or_zeros(ev_1t, self.bins, height, width),
-            ), dim=0).float())
-        # Use physical target timestamps rather than equal-frame-index spacing.
-        t0, t1 = float(timestamps[start]), float(timestamps[end])
-        times = torch.tensor([
-            (float(timestamps[k]) - t0) / (t1 - t0) for k in targets
-        ], dtype=torch.float32)
         return {
             "img0": img0, "img1": img1, "gts": gts,
-            "voxels": torch.stack(voxels), "masks": torch.stack(masks),
+            "voxels": voxels, "masks": masks,
             "t": times,
             "scene": scene["name"], "start": start, "end": end,
             "skip": skip, "targets": targets,

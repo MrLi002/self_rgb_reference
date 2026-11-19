@@ -193,6 +193,39 @@ def test_dataset_multi_target(bins=8):
     print("[ok] dataset: skip=3 window returns 3 targets; batches never mix K")
 
 
+def test_dataset_cropped_event_timestamps():
+    import tempfile
+    from pathlib import Path
+    from datasets import BSERGBTrainDataset
+    from eval_bsergb import BSERGBEvalWindows
+
+    bins = 8
+    origin = 1_700_000_000_000_000
+    with tempfile.TemporaryDirectory() as root:
+        _write_synthetic_bsergb(root, num_frames=3)
+        scene = Path(root) / "scene_000"
+        np.savetxt(scene / "images" / "timestamp.txt", origin + np.array([0, 1000, 3000]), fmt="%d")
+
+        # A centered 64x64 crop of the 64x96 image keeps x=32 and removes x=0 and x=95.
+        for interval, (xs, offsets) in enumerate((([0, 32, 32, 95], [10, 200, 300, 990]),
+                                                ([0, 95], [1100, 2900]))):
+            pixels = np.array(xs)
+            np.savez(scene / "events" / f"{interval:06d}.npz",
+                     x=(pixels + 0.5) * 62000.0 / (2 * 970),
+                     y=np.full(len(xs), 32.5 * 20160.0 / 630),
+                     timestamp=origin + np.array(offsets), polarity=np.ones(len(xs)))
+
+        train = BSERGBTrainDataset(root, bins=bins, skips=(1,), crop_size=64, augment=False)[0]
+        evaluation = BSERGBEvalWindows(root, skips=(1,), bins=bins)[0]
+        expected = torch.tensor([0.0, 0.6, 1.3, 0.1, 0.0, 0.0, 0.0, 0.0])
+        torch.testing.assert_close(train["voxels"][0, :bins, 32, 16], expected)
+        torch.testing.assert_close(train["voxels"], evaluation["voxels"][..., 16:80])
+        assert torch.count_nonzero(train["voxels"][0, bins:]) == 0
+        torch.testing.assert_close(train["t"], torch.tensor([1.0 / 3.0]))
+        torch.testing.assert_close(train["t"], evaluation["t"])
+    print("[ok] dataset: cropped events retain their frame-relative bins in training and evaluation")
+
+
 def test_inference_padding():
     from model.ourModel import Model
     args = make_args("full")
@@ -262,6 +295,7 @@ if __name__ == "__main__":
     test_reverse_voxel()
     test_hcs_equivalence(device)
     test_dataset_multi_target()
+    test_dataset_cropped_event_timestamps()
     for stage_name in ("rec", "flow", "full"):
         test_stage(stage_name, device, num_targets=3)   # skip=3 window
     test_stage("full", device, num_targets=1)           # skip=1 window

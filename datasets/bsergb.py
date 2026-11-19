@@ -91,49 +91,20 @@ def _read_frame_timestamps(path: Path, expected_images: int) -> np.ndarray:
     return timestamps
 
 
-def _timestamp_tolerance(start: float, end: float) -> float:
-    """Allow only tiny rounding error from util.event.load_events' float32 timestamps."""
-    fp32_res = max(
-        float(abs(np.spacing(np.float32(start)))),
-        float(abs(np.spacing(np.float32(end)))),
-    )
-    return max(1e-6 * (end - start), 2.0 * fp32_res)
-
-
 def _load_event_chunks(
     paths: Sequence[Path],
     crop_box: CropBox,
     frame_timestamps: Optional[Sequence[float]] = None,
     start_interval: int = 0,
 ) -> List[np.ndarray]:
-    """Load and crop event files, optionally verifying their true time boundaries.
-
-    ``paths[j]`` covers [T[start_interval+j], T[start_interval+j+1]].
-    ``frame_timestamps=None`` preserves compatibility with older callers; new
-    training code always passes timestamps. For correct evaluation, eval_bsergb.py
-    must pass timestamps as well.
-    """
+    """Load event files, check their frame intervals when provided, then crop."""
     if frame_timestamps is not None and start_interval + len(paths) >= len(frame_timestamps):
         raise IndexError("Event interval indexes exceed frame timestamp array")
     chunks = []
     for offset, path in enumerate(paths):
-        chunk = load_events(str(path), bsergb=True, size=crop_box)
-        if frame_timestamps is not None and chunk.size:
-            t0 = float(frame_timestamps[start_interval + offset])
-            t1 = float(frame_timestamps[start_interval + offset + 1])
-            tolerance = _timestamp_tolerance(t0, t1)
-            event_times = chunk[:, 2]
-            low, high = float(event_times.min()), float(event_times.max())
-            if low < t0 - tolerance or high > t1 + tolerance:
-                raise ValueError(
-                    f"Event timestamps in {path} [{low}, {high}] do not fit "
-                    f"frame interval [{t0}, {t1}]. Check time units, clock "
-                    "origin, filename ordering, and timestamp.txt alignment."
-                )
-            # Roundoff in the .npz float32 timestamps can place a boundary event
-            # a fraction of a unit outside the float64 frame interval.
-            # Snap just those boundary events back inside the true interval.
-            chunk[:, 2] = np.clip(event_times, t0, t1)
+        interval = start_interval + offset
+        bounds = None if frame_timestamps is None else frame_timestamps[interval:interval + 2]
+        chunk = load_events(str(path), bsergb=True, size=crop_box, timestamp_bounds=bounds)
         chunks.append(chunk)
     return chunks
 
@@ -189,6 +160,41 @@ def _event_channels_or_zeros(sequence: Optional[EventSequence], height: int, wid
     if sequence is None or len(sequence) == 0:
         return torch.zeros((2, height, width), dtype=torch.float32)
     return events_to_channels(sequence).float()
+
+
+def _window_event_inputs(
+    event_paths: Sequence[Path], crop_box: CropBox, timestamps: Sequence[float],
+    start: int, end: int, targets: Sequence[int], bins: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build per-target voxels, masks and times using the same bounds in train and eval."""
+    top, left, bottom, right = crop_box
+    height, width = bottom - top, right - left
+    chunks = _load_event_chunks(event_paths[start:end], crop_box, timestamps, start)
+    start_time, end_time = timestamps[start], timestamps[end]
+    voxels, masks, times = [], [], []
+    for target in targets:
+        split = target - start
+        target_time = timestamps[target]
+        events_0t = _sequence_from_chunks(
+            chunks[:split], height, width, start_time=start_time, end_time=target_time,
+        )
+        events_t1 = _sequence_from_chunks(
+            chunks[split:], height, width, start_time=target_time, end_time=end_time,
+        )
+        counts = torch.cat((
+            _event_channels_or_zeros(events_0t, height, width),
+            _event_channels_or_zeros(events_t1, height, width),
+        ))
+        masks.append(process_mask(counts).float())
+        events_1t = None if events_t1 is None else events_t1.copy().reverse()
+        voxels.append(torch.cat((
+            _voxel_or_zeros(events_0t, bins, height, width),
+            _voxel_or_zeros(events_t1, bins, height, width),
+            _voxel_or_zeros(events_1t, bins, height, width),
+        )))
+        times.append((target_time - start_time) / (end_time - start_time))
+
+    return torch.stack(voxels), torch.stack(masks), torch.tensor(times, dtype=torch.float32)
 
 
 class BSERGBTrainDataset(Dataset):
@@ -377,38 +383,9 @@ class BSERGBTrainDataset(Dataset):
         endpoints = torch.cat((read(start), read(end)), dim=0)               # (6, h, w)
         gts = torch.stack([read(target) for target in targets], dim=0)        # (K, 3, h, w)
 
-        # every interval file of the window is read once and shared by all targets
-        chunks = _load_event_chunks(
-            event_paths[start:end], crop_box,
-            frame_timestamps=timestamps, start_interval=start,
+        voxels, masks, times = _window_event_inputs(
+            event_paths, crop_box, timestamps, start, end, targets, self.bins,
         )
-        voxel_list, mask_list = [], []
-        for target in targets:
-            split = target - start                       # number of intervals in [start, target]
-            events_0t = _sequence_from_chunks(
-                chunks[:split], h, w,
-                start_time=timestamps[start], end_time=timestamps[target],
-            )
-            events_t1 = _sequence_from_chunks(
-                chunks[split:], h, w,
-                start_time=timestamps[target], end_time=timestamps[end],
-            )
-            event_counts = torch.cat(
-                (_event_channels_or_zeros(events_0t, h, w), _event_channels_or_zeros(events_t1, h, w)), dim=0)
-            mask_list.append(process_mask(event_counts).float())
-            events_1t = None if events_t1 is None else events_t1.copy().reverse()
-            voxel_list.append(torch.cat((
-                _voxel_or_zeros(events_0t, self.bins, h, w),
-                _voxel_or_zeros(events_t1, self.bins, h, w),
-                _voxel_or_zeros(events_1t, self.bins, h, w),
-            ), dim=0).float())
-        voxels = torch.stack(voxel_list, dim=0)                               # (K, 3*bins, h, w)
-        masks = torch.stack(mask_list, dim=0)                                 # (K, 1, h, w)
-        times = torch.tensor(
-            [(timestamps[target] - timestamps[start]) / (timestamps[end] - timestamps[start])
-             for target in targets],
-            dtype=torch.float32,
-        )                                                                    # (K,)
 
         if self.augment:
             vertical_flip = random.random() < 0.5
